@@ -1,65 +1,59 @@
 import pandas as pd
 import geopandas as gpd
 import xarray as xr
+import numpy as np
 import regionmask
 from shapely import wkb
 
-def decode_wkb_and_create_gdf(csv_file):
-    """Decode WKB geometries from CSV and create a GeoDataFrame."""
-    df = pd.read_csv(csv_file)
-    df['geometry'] = df['geometry'].apply(lambda geom: wkb.loads(eval(geom)) if geom else None)
-    df = df.dropna(subset=['geometry'])
-    gdf = gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")
-    gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.01)
+# Step 1: Load GeoDataFrame
+csv_file = "/Users/sinugp/Downloads/ea_admin0_2_custom_polygon_shapefile_v5.csv"
+df = pd.read_csv(csv_file)
 
-    # Make names unique
-    if gdf['name'].duplicated().any():
-        gdf['name'] = gdf['name'] + "_" + gdf.groupby('name').cumcount().astype(str)
-    return gdf
+# Decode WKB geometries
+def decode_wkb(geometry):
+    try:
+        return wkb.loads(eval(geometry))
+    except:
+        return None
 
-def create_region_mask(gdf, ds):
-    """Create a region mask from GeoDataFrame."""
-    region_mask = regionmask.from_geopandas(gdf, names="name", numbers="id", overlap=False)
-    mask = region_mask.mask(ds['lon'], ds['lat'])
-    return mask
+df['geometry'] = df['geometry'].apply(decode_wkb)
+df = df.dropna(subset=['geometry'])
 
-def expand_and_broadcast_mask(mask, ds):
-    """Expand and broadcast the mask to align with NetCDF dimensions."""
-    aligned_mask = xr.DataArray(mask, dims=['lat', 'lon'], coords={'lat': ds['lat'], 'lon': ds['lon']})
-    for dim in ['lead', 'member', 'init']:
-        aligned_mask = aligned_mask.expand_dims({dim: ds[dim]})
-    expanded_mask = xr.broadcast(aligned_mask, ds)[0]
-    return expanded_mask
+# Create GeoDataFrame
+gdf = gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")
+gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.01)
 
-def subset_netcdf(netcdf_file, csv_file, output_file):
-    """Subset NetCDF data using polygons from CSV."""
-    # Decode WKB and create GeoDataFrame
-    gdf = decode_wkb_and_create_gdf(csv_file)
+# Fix duplicate names
+if gdf['name'].duplicated().any():
+    gdf['name'] = gdf['name'] + "_" + gdf.groupby('name').cumcount().astype(str)
 
-    # Load NetCDF file
-    ds = xr.open_dataset(netcdf_file)
+# Step 2: Load NetCDF File
+netcdf_file = "/Users/sinugp/Downloads/ibf-thresholds-triggers/src/wjr_fct_spi3.nc"
+ds = xr.open_dataset(netcdf_file)
 
-    # Create region mask
-    mask = create_region_mask(gdf, ds)
+# Step 3: Create Region Mask
+region_mask = regionmask.from_geopandas(gdf, names="name", numbers="id", overlap=False)
+mask = region_mask.mask(ds['lon'], ds['lat'])
 
-    # Expand and broadcast mask
-    expanded_mask = expand_and_broadcast_mask(mask, ds)
+# Step 4: Align Mask with All Dimensions
+aligned_mask = xr.DataArray(mask, dims=['lat', 'lon'], coords={'lat': ds['lat'], 'lon': ds['lon']})
+for dim in ['lead', 'member', 'init']:
+    aligned_mask = aligned_mask.expand_dims({dim: ds[dim]})
+aligned_mask = xr.broadcast(aligned_mask, ds)[0]
 
-    # Subset data
-    subset = ds.where(expanded_mask == 1, drop=True)
+# Step 5: Apply the Mask and Subset the Data
+subset = ds.where(aligned_mask == 1, drop=True)
 
-    # Fix attributes and encoding
-    for var in subset.data_vars:
-        subset[var].attrs = {}
-    encoding = {var: {"_FillValue": None} for var in subset.data_vars}
+# Step 6: Debug and Fix Attributes
+# Remove attributes from `lead`
+if 'lead' in subset.variables:
+    subset['lead'].attrs = {}
 
-    # Save subsetted data
-    subset.to_netcdf(output_file, encoding=encoding, engine="netcdf4")
-    print(f"Subsetted NetCDF file saved successfully at {output_file}")
+# Define encoding to remove `_FillValue`
+encoding = {var: {"_FillValue": None} for var in subset.data_vars}
 
-if __name__ == "__main__":
-    netcdf_file = "wjr_fct_spi3.nc"
-    csv_file = "ea_admin0_2_custom_polygon_shapefile_v5.csv"
-    output_file = "subsetted_data.nc"
+# Step 7: Save the Subsetted File
+output_file = "/Users/sinugp/Downloads/subsetted_file.nc"
+subset.to_netcdf(output_file, encoding=encoding, engine="netcdf4")
 
-    subset_netcdf(netcdf_file, csv_file, output_file)
+print(f"Subsetted NetCDF file saved successfully at {output_file}")
