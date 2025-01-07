@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import pandas as pd
 import fsspec
 from google.oauth2 import service_account
@@ -11,6 +13,8 @@ import numpy as np
 import regionmask
 from dotenv import load_dotenv
 import os
+
+from climpred import HindcastEnsemble
 
 # Load environment variables
 load_dotenv()
@@ -338,5 +342,256 @@ def main_processing_pipeline():
     regridded_forecast = regrid_forecast(forecast_spi, obs_spi)
     regridded_forecast.to_netcdf(f"{env_vars['output_path']}_forecast_spi3.nc")
 
-if __name__ == "__main__":
-    main_processing_pipeline()
+
+class BinCreateParams:
+    def __init__(
+        self,
+        region_id,
+        season_str,
+        lead_int,
+        level,
+        region_name_dict,
+        spi_prod_name,
+        data_path,
+        spi4_data_path,
+        output_path,
+        obs_netcdf_file,
+        fct_netcdf_file,
+        service_account_json,
+        gcs_file_url,
+        region_filter
+    ):
+        self.region_id = region_id
+        self.season_str = season_str
+        self.lead_int = lead_int
+        self.sc_season_str = season_str.lower()
+        self.level = level
+        self.region_name_dict = region_name_dict
+        self.spi_prod_name = spi_prod_name
+        self.data_path = self._ensure_trailing_slash(data_path)
+        self.spi4_data_path = self._ensure_trailing_slash(spi4_data_path)
+        self.output_path = self._ensure_trailing_slash(output_path)
+        self.obs_netcdf_file = obs_netcdf_file
+        self.fct_netcdf_file = fct_netcdf_file
+        self.service_account_json = service_account_json
+        self.gcs_file_url = gcs_file_url
+        self.region_filter = region_filter
+
+        # Create necessary directories
+        self._create_directories()
+
+    def _ensure_trailing_slash(self, path):
+        """Ensure the path ends with a trailing slash."""
+        if not path.endswith(os.path.sep):
+            return os.path.join(path, '')
+        return path
+
+    def _create_directories(self):
+        """Create necessary directories if they don't exist."""
+        directories = [self.output_path]
+        for directory in directories:
+            os.makedirs(directory, exist_ok=True)
+        print(f"Directories created/checked: {', '.join(directories)}")
+
+def spi3_prod_name_creator(ds_ens, var_name):
+    """
+    Convenience function to generate a list of SPI product
+    names, such as MAM, so that can be used to filter the
+    SPI product from dataframe
+
+    added with method to convert the valid_time in CF format into datetime at
+    line 3, which is the format given by climpred valid_time calculation
+
+    Parameters
+    ----------
+    ds_ens : xarray dataframe
+        The data farme with SPI output organized for
+        the period 1981-2023.
+
+    Returns
+    -------
+    spi_prod_list : String list
+        List of names with iteration of SPI3 product names such as
+        ['JFM','FMA','MAM',......]
+
+    """
+    db = pd.DataFrame()
+    db["dt"] = ds_ens[var_name].values
+    db["dt1"] = db["dt"].apply(
+        lambda x: datetime(x.year, x.month, x.day, x.hour, x.minute, x.second)
+    )
+    # db['dt1']=db['dt'].to_datetimeindex()
+    db["month"] = db["dt1"].dt.strftime("%b").astype(str).str[0]
+    db["year"] = db["dt1"].dt.strftime("%Y")
+    db["spi_prod"] = (
+        db.groupby("year")["month"].shift(2)
+        + db.groupby("year")["month"].shift(1)
+        + db.groupby("year")["month"].shift(0)
+    )
+    spi_prod_list = db["spi_prod"].tolist()
+    return spi_prod_list
+
+
+def spi4_prod_name_creator(ds_ens, var_name):
+    """
+    Convenience function to generate a list of SPI product
+    names, such as MAM, so that can be used to filter the
+    SPI product from dataframe
+
+    added with method to convert the valid_time in CF format into datetime at
+    line 3, which is the format given by climpred valid_time calculation
+
+    Parameters
+    ----------
+    ds_ens : xarray dataframe
+        The data farme with SPI output organized for
+        the period 1981-2023.
+
+    Returns
+    -------
+    spi_prod_list : String list
+        List of names with iteration of SPI3 product names such as
+        ['JFM','FMA','MAM',......]
+
+    """
+    db = pd.DataFrame()
+    db["dt"] = ds_ens[var_name].values
+    db["dt1"] = db["dt"].apply(
+        lambda x: datetime(x.year, x.month, x.day, x.hour, x.minute, x.second)
+    )
+    # db['dt1']=db['dt'].to_datetimeindex()
+    db["month"] = db["dt1"].dt.strftime("%b").astype(str).str[0]
+    db["year"] = db["dt1"].dt.strftime("%Y")
+    db["spi_prod"] = (
+        db.groupby("year")["month"].shift(3)
+        + db.groupby("year")["month"].shift(2)
+        + db.groupby("year")["month"].shift(1)
+        + db.groupby("year")["month"].shift(0)
+    )
+    spi_prod_list = db["spi_prod"].tolist()
+    return spi_prod_list
+
+
+
+def make_obs_fct_dataset(params):
+    """
+    Prepares observed and forecasted dataset subsets for a specific region, season, and lead time.
+
+    This function loads observed and forecasted datasets based on the season string length (indicating SPI3 or SPI4),
+    applies regional masking, selects the data for the given region by its ID, and subsets the data for the specified
+    season and lead time. It then aligns the observed dataset time coordinates with the forecasted dataset valid time
+    coordinates and returns both datasets.
+
+    Parameters:
+    - region_id (int): The identifier for the region of interest.
+    - season_str (str): A string representing the season. The length of this string determines whether SPI3 or SPI4
+                        datasets are used ('mam', 'jjas', etc. for SPI3, and longer strings for SPI4).
+    - lead_int (int): The lead time index for which the forecast dataset is to be subset.
+
+    Returns:
+    - obs_data (xarray.DataArray): The subsetted observed data array for the specified region, season, and aligned time coordinates.
+    - ens_data (xarray.DataArray): The subsetted forecast data array for the specified region, season, lead time, and aligned time coordinates.
+
+    Notes:
+    - The function assumes the existence of a `data_path` variable that specifies the base path to the dataset files.
+    - It requires the `xarray` library for data manipulation and assumes specific naming conventions for the dataset files.
+    - Regional masking and season-specific processing rely on externally defined functions and naming conventions.
+    - The final alignment of observed dataset time coordinates with forecasted dataset valid time coordinates ensures
+      comparability between observed and forecasted values for verification purposes.
+
+    Example Usage:
+    >>> obs_data, ens_data = make_obs_fct_dataset(1, 'mam', 0)
+    >>> print(obs_data)
+    >>> print(ens_data)
+
+    This would load the observed and forecasted SPI3 datasets for region 1 during the 'mam' season and subset them
+    for lead time index 0, aligning the observed data time coordinates with the forecasted data valid time coordinates.
+    """
+    try:
+        #the_mask, rl_dict, mds1 = gcs_paraquet_mask_creator(params)
+        #bounds = mds1.bounds
+        #llon, llat = bounds.iloc[params.region_id][["minx", "miny"]]
+        #ulon, ulat = bounds.iloc[params.region_id][["maxx", "maxy"]]
+
+        #logger.debug(
+        #    f"Region bounds: llon={llon}, llat={llat}, ulon={ulon}, ulat={ulat}"
+        #)
+
+        if len(params.season_str) == 3:
+            kn_obs = xr.open_dataset('./kmj-25km-chirps-v2.0.monthly.nc')
+            kn_fct = xr.open_dataset('./kn_fct_spi3.nc')
+            #logger.info("Loaded SPI3 datasets")
+        else:
+            kn_fct = xr.open_dataset(os.path.join(params.data_path, params.fct_netcdf_file))
+            kn_obs = xr.open_dataset(os.path.join(params.data_path, params.obs_netcdf_file))
+            #logger.info("Loaded SPI4 datasets")
+
+        #a_fc = kn_fct.sel(lon=slice(llon, ulon), lat=slice(llat, ulat))
+        #a_obs = kn_obs.sel(lon=slice(llon, ulon), lat=slice(llat, ulat))
+        a_obs=kn_obs
+        a_fc=kn_fct
+        print("subsetted obs and fcst to given region")
+        print("Created HindcastEnsemble")
+        hindcast = HindcastEnsemble(a_fc)
+        hindcast = hindcast.add_observations(a_obs)
+
+        a_fc1 = hindcast.get_initialized()
+        print("Added climpred HindcastEnsemble to add valid_time in fcst")
+        a_fc2 = a_fc1.isel(lead=params.lead_int)
+
+        if len(params.season_str) == 3:
+            spi_prod_list = spi3_prod_name_creator(a_fc2, "valid_time")
+            obs_spi_prod_list = spi3_prod_name_creator(a_obs, "time")
+        else:
+            spi_prod_list = spi4_prod_name_creator(a_fc2, "valid_time")
+            obs_spi_prod_list = spi4_prod_name_creator(a_obs, "time")
+        print(
+            f"added SPI prodcut in obs and fcst dataset, filtered to {params.season_str}"
+        )
+        a_fc2 = a_fc2.assign_coords(spi_prod=("init", spi_prod_list))
+        a_fc3 = a_fc2.where(a_fc2.spi_prod == params.season_str, drop=True)
+
+        a_obs1 = a_obs.assign_coords(spi_prod=("time", obs_spi_prod_list))
+        a_obs2 = a_obs1.where(a_obs1.spi_prod == params.season_str, drop=True)
+
+        # Convert valid_time to numpy datetime64 for comparison from cftime of a_fc3
+        fct_valid_times = np.array(
+            [np.datetime64(vt.isoformat()) for vt in a_fc3.valid_time.values]
+        )
+        obs_times = a_obs2.time.values
+
+        # Find common dates
+        common_dates = np.intersect1d(fct_valid_times, obs_times)
+
+        # common_dates = np.unique(a_fc3.valid_time.values.ravel())
+        # Filter both datasets to include only common dates
+        # a_fc4 = a_fc3.sel(valid_time=common_dates)
+        a_obs3 = a_obs2.sel(time=common_dates)
+        # a_obs3 = a_obs2.sel(time=common_dates)
+        a_fc3_init_dates = common_dates.astype("datetime64[M]") - np.timedelta64(
+            int(a_fc3.lead.values), "M"
+        )
+        a_fc4 = a_fc3.sel(init=a_fc3_init_dates)
+        # Ensure the time dimension in a_fc4 matches the valid_time coordinate
+        # a_fc4 = a_fc4.assign_coords(time=('valid_time', common_dates))
+        # a_fc4 = a_fc4.swap_dims({'valid_time': 'time'})
+
+        print(
+            f"Found {len(common_dates)} common dates between observed and forecast data"
+        )
+        print("Successfully prepared observed and forecasted datasets")
+
+        return a_obs3, a_fc4
+
+    except FileNotFoundError as e:
+        print(f"File not found: {e}")
+        raise
+    except ValueError as e:
+        print(f"Value error: {e}")
+        raise
+    except Exception as e:
+        print(f"Unexpected error in make_obs_fct_dataset: {e}")
+        raise
+    # return a_obs3, a_fc3
+
+
